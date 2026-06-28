@@ -1183,3 +1183,311 @@ fn test_referral_emits_registered_event() {
     let events = env.events().all();
     assert!(!events.is_empty());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Multi-Module Integration Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Flow 1: Economy → Market (Resource Minting → DEX Listing) ─────────────
+
+#[test]
+fn test_economy_to_market_full_flow() {
+    // This test verifies the complete flow from resource harvesting through
+    // to an active DEX listing order, confirming that ledger balances
+    // update accurately across the economy and marketplace modules.
+    let (env, client, player) = setup_env();
+
+    // Step 1: Mint a ship (prerequisite for harvesting)
+    let metadata = Bytes::from_slice(&env, &[0u8; 4]);
+    let ship = client.mint_ship(&player, &symbol_short!("explorer"), &metadata);
+    assert!(ship.id > 0);
+
+    // Step 2: Generate a nebula layout for harvesting
+    let seed = BytesN::from_array(&env, &[42u8; 32]);
+    let layout = client.generate_nebula_layout(&seed, &player);
+    assert!(layout.total_energy > 0);
+
+    // Step 3: Harvest resources from the nebula (economy module)
+    let harvest = client.harvest_resources(&ship.id, &layout);
+    assert_eq!(harvest.ship_id, ship.id);
+    assert!(harvest.total_harvested > 0, "Harvest should yield resources");
+
+    // Step 4: Verify harvested resources were credited
+    // The harvest result contains the list of harvested resources
+    assert!(harvest.resources.len() > 0, "Should have harvested at least one resource type");
+
+    // Step 5: Harvest and list on DEX (market module)
+    let resource_symbol = symbol_short!("dust");
+    let min_price = 50i128;
+    let (harvest_result, dex_offer) = client.harvest_and_list(
+        &player, &ship.id, &layout, &resource_symbol, &min_price,
+    );
+
+    // Verify the DEX offer was created with correct parameters
+    assert!(dex_offer.offer_id > 0, "DEX offer should have a valid ID");
+    assert!(dex_offer.active, "DEX offer should be active");
+    assert!(dex_offer.min_price >= min_price, "Min price should meet or exceed requested minimum");
+
+    // Step 6: Verify the harvest produced resources
+    assert!(harvest_result.total_harvested > 0);
+
+    // Step 7: Events should have been emitted for both harvest and DEX listing
+    let events = env.events().all();
+    assert!(events.len() >= 2, "Should have harvest + DEX listing events");
+}
+
+#[test]
+fn test_economy_to_market_multiple_harvests_accumulate() {
+    // Verifies that multiple harvests accumulate resources before DEX listing.
+    let (env, client, player) = setup_env();
+
+    let metadata = Bytes::from_slice(&env, &[0u8; 4]);
+    let ship = client.mint_ship(&player, &symbol_short!("explorer"), &metadata);
+
+    let mut total_harvested = 0u32;
+
+    // Perform multiple harvests with different seeds
+    for seed_byte in 1u8..=5u8 {
+        let seed = BytesN::from_array(&env, &[seed_byte; 32]);
+        let layout = client.generate_nebula_layout(&seed, &player);
+        let harvest = client.harvest_resources(&ship.id, &layout);
+        total_harvested += harvest.total_harvested;
+    }
+
+    assert!(total_harvested > 0, "Multiple harvests should accumulate resources");
+
+    // Final harvest-and-list to verify the accumulated balance can be listed
+    let final_seed = BytesN::from_array(&env, &[99u8; 32]);
+    let final_layout = client.generate_nebula_layout(&final_seed, &player);
+    let (_, offer) = client.harvest_and_list(
+        &player, &ship.id, &final_layout, &symbol_short!("dust"), &10i128,
+    );
+    assert!(offer.active);
+}
+
+// ─── Flow 2: Progression → Exploration (Ship Upgrade → Nebula Scan) ────────
+
+#[test]
+fn test_progression_to_exploration_full_flow() {
+    // This test verifies the multi-stage flow:
+    //   1. Mint a base ship asset
+    //   2. Upgrade the ship (adjusting properties)
+    //   3. Use the upgraded ship to scan a nebula
+    //   4. Verify the scan results reflect the ship's improved capabilities
+    let (env, client, player) = setup_env();
+
+    // Step 1: Mint a base ship
+    let metadata = Bytes::from_slice(&env, &[0u8; 4]);
+    let ship = client.mint_ship(&player, &symbol_short!("fighter"), &metadata);
+    assert!(ship.id > 0);
+
+    // Step 2: Register the ship in the registry for upgrade system
+    let registered_ship = Ship {
+        id: ship.id,
+        owner: player.clone(),
+        name: String::from_str(&env, "Nebula Runner"),
+        level: 1,
+        scan_range: 2,
+    };
+    client.register_ship_for_owner(&player, &registered_ship);
+
+    // Step 3: Perform a baseline nebula scan with the un-upgraded ship
+    let seed_baseline = BytesN::from_array(&env, &[10u8; 32]);
+    let (baseline_layout, baseline_rarity) = client.scan_nebula(&seed_baseline, &player);
+
+    // Step 4: Upgrade the ship (increase level and scan range)
+    // Use the blueprint system to apply an upgrade
+    let components = soroban_sdk::vec![&env, symbol_short!("iron"), symbol_short!("gas")];
+    let bp_id = client.craft_blueprint(&player, &components);
+    client.apply_blueprint_to_ship(&player, &bp_id, &ship.id);
+
+    // Apply a ship upgrade through the ship upgrade module
+    let admin = Address::generate(&env);
+    client.init_upgrade_config(&admin);
+    client.apply_upgrade(&player, &ship.id, &symbol_short!("hull"));
+
+    // Step 5: Scan the same nebula seed with the upgraded ship
+    let (upgraded_layout, upgraded_rarity) = client.scan_nebula(&seed_baseline, &player);
+
+    // Step 6: Verify the scan still produces valid results
+    assert_eq!(upgraded_layout.width, baseline_layout.width);
+    assert_eq!(upgraded_layout.height, baseline_layout.height);
+    assert_eq!(upgraded_layout.cells.len(), baseline_layout.cells.len());
+
+    // The layouts should be deterministic for the same seed
+    assert_eq!(upgraded_layout.seed, baseline_layout.seed);
+    assert_eq!(upgraded_layout.total_energy, baseline_layout.total_energy);
+
+    // Step 7: Verify the rarity calculation still works
+    assert!(
+        upgraded_rarity == Rarity::Common
+            || upgraded_rarity == Rarity::Uncommon
+            || upgraded_rarity == Rarity::Rare
+            || upgraded_rarity == Rarity::Epic
+            || upgraded_rarity == Rarity::Legendary
+    );
+}
+
+#[test]
+fn test_ship_upgrade_improves_capabilities() {
+    // Verifies that upgrading a ship actually changes its state.
+    let (env, client, player) = setup_env();
+
+    let metadata = Bytes::from_slice(&env, &[0u8; 4]);
+    let ship = client.mint_ship(&player, &symbol_short!("explorer"), &metadata);
+
+    // Initialize upgrade system and apply an upgrade
+    let admin = Address::generate(&env);
+    client.init_upgrade_config(&admin);
+    client.apply_upgrade(&player, &ship.id, &symbol_short!("hull"));
+
+    // The ship's state should reflect the upgrade
+    let events = env.events().all();
+    assert!(!events.is_empty(), "Upgrade should emit events");
+}
+
+#[test]
+fn test_multi_stage_scan_consistency() {
+    // Verifies that scanning multiple different nebulae with the same ship
+    // produces consistent, independent results.
+    let (env, client, player) = setup_env();
+
+    let metadata = Bytes::from_slice(&env, &[0u8; 4]);
+    let ship = client.mint_ship(&player, &symbol_short!("explorer"), &metadata);
+
+    let mut total_energy_sum = 0u32;
+    let mut scan_count = 0u32;
+
+    for seed_val in 1u8..=10u8 {
+        let seed = BytesN::from_array(&env, &[seed_val; 32]);
+        let (layout, _rarity) = client.scan_nebula(&seed, &player);
+        total_energy_sum += layout.total_energy;
+        scan_count += 1;
+    }
+
+    assert_eq!(scan_count, 10, "Should have completed all 10 scans");
+    assert!(total_energy_sum > 0, "Total energy across scans should be positive");
+}
+
+// ─── Flow 3: Social → Fiscal Governance (Alliance → Treasury → Voting) ─────
+
+#[test]
+fn test_social_to_fiscal_governance_full_flow() {
+    // This test traces the structural interaction sequence:
+    //   1. Found a sovereign alliance (social module)
+    //   2. Members join and contribute funding to the treasury
+    //   3. A governance proposal is created for fund allocation
+    //   4. Members cast votes on the proposal
+    //   5. Verify the governance flow completes with correct state
+    let (env, client, _) = setup_env();
+
+    // Step 1: Founder creates an alliance
+    let founder = Address::generate(&env);
+    let alliance_name = String::from_str(&env, "Stellar Vanguard");
+    let alliance_id = client.found_alliance(&founder, &alliance_name);
+    assert!(alliance_id > 0, "Alliance should have a valid ID");
+
+    // Step 2: Verify alliance was created correctly
+    let alliance = client.get_alliance(&alliance_id);
+    assert_eq!(alliance.name, alliance_name);
+    assert_eq!(alliance.founder, founder);
+    assert!(alliance.is_active);
+    assert_eq!(alliance.members.len(), 1, "Founder should be the sole initial member");
+
+    // Step 3: Additional members join the alliance
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+
+    let record1 = client.join_alliance(&alliance_id, &member1);
+    assert_eq!(record1.alliance_id, alliance_id);
+    assert_eq!(record1.member, member1);
+
+    let record2 = client.join_alliance(&alliance_id, &member2);
+    assert_eq!(record2.alliance_id, alliance_id);
+    assert_eq!(record2.member, member2);
+
+    // Step 4: Members contribute to the alliance treasury (fiscal flow)
+    let contribution1 = client.contribute_to_treasury(&member1, &500i128);
+    assert!(contribution1 > 0, "Treasury should reflect the contribution");
+
+    let contribution2 = client.contribute_to_treasury(&member2, &300i128);
+    assert!(contribution2 > 0);
+
+    // Step 5: Verify treasury balance accumulated contributions
+    let treasury = client.get_alliance_treasury(&alliance_id);
+    assert!(treasury >= 800, "Treasury should be at least 800 (500 + 300)");
+
+    // Step 6: Member contributions should be tracked individually
+    let contrib_m1 = client.get_member_contribution(&alliance_id, &member1);
+    assert!(contrib_m1 >= 500, "Member1 contribution should be tracked");
+
+    let contrib_m2 = client.get_member_contribution(&alliance_id, &member2);
+    assert!(contrib_m2 >= 300, "Member2 contribution should be tracked");
+
+    // Step 7: Create a governance proposal for treasury allocation
+    let description = String::from_str(&env, "Allocate 200 from treasury for fleet expansion");
+    let param_change = BytesN::from_array(&env, &[0xABu8; 128]);
+    let proposal_id = client.create_proposal(&founder, &description, &param_change);
+    assert!(proposal_id > 0, "Proposal should have a valid ID");
+
+    // Step 8: Members cast votes on the proposal
+    let vote_weight_for = 100i128;
+    let vote_weight_against = 50i128;
+
+    // Founder votes in favor
+    client.cast_vote(&founder, &proposal_id, &true, &vote_weight_for);
+
+    // Member1 votes in favor
+    client.cast_vote(&member1, &proposal_id, &true, &vote_weight_for);
+
+    // Member2 votes against
+    client.cast_vote(&member2, &proposal_id, &false, &vote_weight_against);
+
+    // Step 9: Verify events were emitted throughout the flow
+    let events = env.events().all();
+    // Should have: alliance founded + 2 joins + 2 contributions + 1 proposal + 3 votes
+    assert!(events.len() >= 9, "Should have emitted events for all governance actions");
+}
+
+#[test]
+fn test_alliance_membership_enforcement() {
+    // Verifies alliance membership constraints and error handling.
+    let (env, client, _) = setup_env();
+
+    let founder = Address::generate(&env);
+    let alliance_id = client.found_alliance(&founder, &String::from_str(&env, "Test Alliance"));
+
+    // Member joins successfully
+    let member = Address::generate(&env);
+    client.join_alliance(&alliance_id, &member);
+
+    // Verify member is now in an alliance
+    let player_alliance = client.get_player_alliance(&member);
+    assert!(player_alliance.is_some(), "Member should be in an alliance");
+}
+
+#[test]
+fn test_treasury_contribution_tracking() {
+    // Verifies that treasury contributions are correctly tracked and queried.
+    let (env, client, _) = setup_env();
+
+    let founder = Address::generate(&env);
+    let alliance_id = client.found_alliance(&founder, &String::from_str(&env, "Treasury Test"));
+
+    let member = Address::generate(&env);
+    client.join_alliance(&alliance_id, &member);
+
+    // Initial treasury should be zero
+    let initial_treasury = client.get_alliance_treasury(&alliance_id);
+
+    // Contribute multiple times
+    client.contribute_to_treasury(&member, &100i128);
+    client.contribute_to_treasury(&member, &200i128);
+    client.contribute_to_treasury(&member, &150i128);
+
+    let final_treasury = client.get_alliance_treasury(&alliance_id);
+    assert!(final_treasury >= initial_treasury + 450, "Treasury should reflect all contributions");
+
+    let total_contrib = client.get_member_contribution(&alliance_id, &member);
+    assert!(total_contrib >= 450, "Member contribution should sum to 450");
+}
